@@ -1,8 +1,4 @@
 python-telegram-bot==20.7
 python-dotenv==1.0.1
 cryptography==42.0.5
-<<<<<<< HEAD
-aiosqlite==0.20.0
-=======
 asyncpg==0.29.0
->>>>>>> 97a9d94 (migrate: SQLite → PostgreSQL (asyncpg))
