@@ -20,7 +20,6 @@ from __future__ import annotations
 import io
 import logging
 import os
-import shutil
 from datetime import datetime
 from functools import wraps
 from typing import Callable
@@ -40,7 +39,6 @@ from config import (
     BACKUP_DIR,
     BOT_TOKEN,
     DATA_DIR,
-    DB_PATH,
     ITEMS_PER_PAGE,
     LOG_DIR,
     MAX_MSG_LEN,
@@ -425,16 +423,47 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @owner_only
 async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = f"{BACKUP_DIR}/backup_{ts}.db"
-    shutil.copy(DB_PATH, dest)
-    logger.info("Backup created: %s", dest)
-    with open(dest, "rb") as fh:
-        await update.message.reply_document(
-            document=fh,
-            filename=f"backup_{ts}.db",
-            caption=f"💾 Database backup — {ts}",
-        )
+    """Export all data as a readable text dump (PostgreSQL — no local file)."""
+    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    lines = [f"AI Memory Bot — Full Backup ({ts})", "=" * 50, ""]
+
+    # Memories
+    lines += ["=== MEMORIES ===", ""]
+    mem_rows = await db.fetch_memories()
+    for row in mem_rows:
+        try:
+            dec = crypto.decrypt(row[2])
+        except Exception:
+            dec = "[decryption error]"
+        lines += [
+            f"ID       : {row[0]}",
+            f"Category : {row[1]}",
+            f"Text     : {dec}",
+            f"Date     : {row[3]}",
+            "-" * 40,
+            "",
+        ]
+
+    # Media
+    lines += ["=== MEDIA ===", ""]
+    med_rows = await db.fetch_media()
+    for row in med_rows:
+        lines += [
+            f"ID        : {row[0]}",
+            f"Type      : {row[1]}",
+            f"Caption   : {row[2] or '—'}",
+            f"Date      : {row[3]}",
+            "-" * 40,
+            "",
+        ]
+
+    content = "\n".join(lines).encode("utf-8")
+    logger.info("Backup exported at %s", ts)
+    await update.message.reply_document(
+        document=io.BytesIO(content),
+        filename=f"backup_{ts}.txt",
+        caption=f"💾 Full data backup — {ts}",
+    )
 
 
 @owner_only
@@ -538,15 +567,36 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     elif data == "nav:backup":
-        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = f"{BACKUP_DIR}/backup_{ts}.db"
-        shutil.copy(DB_PATH, dest)
-        with open(dest, "rb") as fh:
-            await query.message.reply_document(
-                document=fh,
-                filename=f"backup_{ts}.db",
-                caption=f"💾 Database backup — {ts}",
-            )
+        ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+        lines = [f"AI Memory Bot — Full Backup ({ts})", "=" * 50, ""]
+        lines += ["=== MEMORIES ===", ""]
+        for row in await db.fetch_memories():
+            try:
+                dec = crypto.decrypt(row[2])
+            except Exception:
+                dec = "[decryption error]"
+            lines += [
+                f"ID       : {row[0]}",
+                f"Category : {row[1]}",
+                f"Text     : {dec}",
+                f"Date     : {row[3]}",
+                "-" * 40, "",
+            ]
+        lines += ["=== MEDIA ===", ""]
+        for row in await db.fetch_media():
+            lines += [
+                f"ID      : {row[0]}",
+                f"Type    : {row[1]}",
+                f"Caption : {row[2] or '—'}",
+                f"Date    : {row[3]}",
+                "-" * 40, "",
+            ]
+        content = "\n".join(lines).encode("utf-8")
+        await query.message.reply_document(
+            document=io.BytesIO(content),
+            filename=f"backup_{ts}.txt",
+            caption=f"💾 Full data backup — {ts}",
+        )
 
     elif data.startswith("nav:all:"):
         page = int(data.split(":")[-1])

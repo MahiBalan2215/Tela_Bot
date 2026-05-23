@@ -1,54 +1,53 @@
 """
-database.py — Async SQLite layer using aiosqlite.
+database.py — Async PostgreSQL layer using asyncpg.
 All queries are centralised here; no SQL leaks into handlers.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime
 from typing import Optional
 
-import aiosqlite
+import asyncpg
 
-from config import DATA_DIR, DB_PATH
+from config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
-    """Async wrapper around the SQLite database."""
+    """Async wrapper around a PostgreSQL connection pool."""
 
-    def __init__(self, path: str) -> None:
-        self.path = path
-        os.makedirs(DATA_DIR, exist_ok=True)
+    def __init__(self) -> None:
+        self._pool: Optional[asyncpg.Pool] = None
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        async with aiosqlite.connect(self.path) as conn:
-            await conn.executescript("""
+        """Create the connection pool and ensure tables exist."""
+        self._pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id         SERIAL PRIMARY KEY,
                     category   TEXT    NOT NULL,
                     encrypted  TEXT    NOT NULL,
                     created_at TEXT    NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_mem_cat
-                    ON memories (category COLLATE NOCASE);
+                    ON memories (LOWER(category));
 
                 CREATE TABLE IF NOT EXISTS media (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id         SERIAL PRIMARY KEY,
                     media_type TEXT    NOT NULL,
                     file_id    TEXT    NOT NULL,
                     caption    TEXT    DEFAULT '',
                     created_at TEXT    NOT NULL
                 );
             """)
-            await conn.commit()
-        logger.info("Database ready at %s", self.path)
+        logger.info("PostgreSQL database ready.")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -56,16 +55,21 @@ class DatabaseManager:
     def _now() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    @property
+    def pool(self) -> asyncpg.Pool:
+        if self._pool is None:
+            raise RuntimeError("Database not initialised. Call initialize() first.")
+        return self._pool
+
     # ── Memories ──────────────────────────────────────────────────────────────
 
     async def add_memory(self, category: str, encrypted: str) -> int:
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(
-                "INSERT INTO memories (category, encrypted, created_at) VALUES (?,?,?)",
-                (category, encrypted, self._now()),
-            )
-            await conn.commit()
-            return cur.lastrowid  # type: ignore[return-value]
+        row = await self.pool.fetchrow(
+            "INSERT INTO memories (category, encrypted, created_at) "
+            "VALUES ($1, $2, $3) RETURNING id",
+            category, encrypted, self._now(),
+        )
+        return row["id"]  # type: ignore[index]
 
     async def fetch_memories(
         self,
@@ -74,87 +78,83 @@ class DatabaseManager:
         limit: int = 0,
         offset: int = 0,
     ) -> list[tuple]:
-        q = "SELECT id, category, encrypted, created_at FROM memories"
-        params: list = []
         if category:
-            q += " WHERE category LIKE ? COLLATE NOCASE"
-            params.append(f"%{category}%")
-        q += " ORDER BY id DESC"
+            q = (
+                "SELECT id, category, encrypted, created_at FROM memories "
+                "WHERE LOWER(category) LIKE LOWER($1) ORDER BY id DESC"
+            )
+            params = [f"%{category}%"]
+        else:
+            q = "SELECT id, category, encrypted, created_at FROM memories ORDER BY id DESC"
+            params = []
+
         if limit:
-            q += " LIMIT ? OFFSET ?"
+            q += f" LIMIT ${len(params)+1} OFFSET ${len(params)+2}"
             params += [limit, offset]
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(q, params)
-            return await cur.fetchall()
+
+        rows = await self.pool.fetch(q, *params)
+        return [tuple(r) for r in rows]
 
     async def delete_memory(self, mid: int) -> bool:
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute("DELETE FROM memories WHERE id=?", (mid,))
-            await conn.commit()
-            return cur.rowcount > 0
+        result = await self.pool.execute("DELETE FROM memories WHERE id=$1", mid)
+        return result.split()[-1] != "0"  # "DELETE N" — N > 0 means success
 
     async def count_memories(self, *, category: str = "") -> int:
-        q, params = "SELECT COUNT(*) FROM memories", []
         if category:
-            q += " WHERE category LIKE ? COLLATE NOCASE"
-            params.append(f"%{category}%")
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(q, params)
-            row = await cur.fetchone()
-            return row[0] if row else 0
+            row = await self.pool.fetchrow(
+                "SELECT COUNT(*) FROM memories WHERE LOWER(category) LIKE LOWER($1)",
+                f"%{category}%",
+            )
+        else:
+            row = await self.pool.fetchrow("SELECT COUNT(*) FROM memories")
+        return row[0] if row else 0  # type: ignore[index]
 
     # ── Media ─────────────────────────────────────────────────────────────────
 
     async def add_media(self, media_type: str, file_id: str, caption: str = "") -> int:
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(
-                "INSERT INTO media (media_type, file_id, caption, created_at) VALUES (?,?,?,?)",
-                (media_type, file_id, caption, self._now()),
-            )
-            await conn.commit()
-            return cur.lastrowid  # type: ignore[return-value]
+        row = await self.pool.fetchrow(
+            "INSERT INTO media (media_type, file_id, caption, created_at) "
+            "VALUES ($1, $2, $3, $4) RETURNING id",
+            media_type, file_id, caption, self._now(),
+        )
+        return row["id"]  # type: ignore[index]
 
     async def fetch_media(self, *, limit: int = 0, offset: int = 0) -> list[tuple]:
         q = "SELECT id, media_type, caption, created_at FROM media ORDER BY id DESC"
         params: list = []
         if limit:
-            q += " LIMIT ? OFFSET ?"
+            q += " LIMIT $1 OFFSET $2"
             params = [limit, offset]
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(q, params)
-            return await cur.fetchall()
+        rows = await self.pool.fetch(q, *params)
+        return [tuple(r) for r in rows]
 
     async def get_media(self, mid: int) -> Optional[tuple]:
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(
-                "SELECT media_type, file_id, caption FROM media WHERE id=?", (mid,)
-            )
-            return await cur.fetchone()
+        row = await self.pool.fetchrow(
+            "SELECT media_type, file_id, caption FROM media WHERE id=$1", mid
+        )
+        return tuple(row) if row else None
 
     async def delete_media(self, mid: int) -> bool:
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute("DELETE FROM media WHERE id=?", (mid,))
-            await conn.commit()
-            return cur.rowcount > 0
+        result = await self.pool.execute("DELETE FROM media WHERE id=$1", mid)
+        return result.split()[-1] != "0"
 
     async def count_media(self) -> int:
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute("SELECT COUNT(*) FROM media")
-            row = await cur.fetchone()
-            return row[0] if row else 0
+        row = await self.pool.fetchrow("SELECT COUNT(*) FROM media")
+        return row[0] if row else 0  # type: ignore[index]
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def stats(self) -> dict:
-        async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(
-                "SELECT COUNT(*), COUNT(DISTINCT category) FROM memories"
-            )
-            mem_total, cat_total = await cur.fetchone()  # type: ignore[misc]
-            cur = await conn.execute("SELECT COUNT(*) FROM media")
-            media_total = (await cur.fetchone())[0]  # type: ignore[index]
-        return {"memories": mem_total, "categories": cat_total, "media": media_total}
+        mem_row = await self.pool.fetchrow(
+            "SELECT COUNT(*), COUNT(DISTINCT LOWER(category)) FROM memories"
+        )
+        med_row = await self.pool.fetchrow("SELECT COUNT(*) FROM media")
+        return {
+            "memories":   mem_row[0],   # type: ignore[index]
+            "categories": mem_row[1],   # type: ignore[index]
+            "media":      med_row[0],   # type: ignore[index]
+        }
 
 
 # Singleton
-db = DatabaseManager(DB_PATH)
+db = DatabaseManager()
